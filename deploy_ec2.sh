@@ -37,7 +37,12 @@ die() {
 
 require_root() {
   if [[ "${EUID}" -ne 0 ]]; then
-    exec sudo -E bash "$0" "$@"
+    exec sudo \
+      XVIDEO_BOT_TOKEN="${XVIDEO_BOT_TOKEN:-}" \
+      TELEGRAM_API_ID="${TELEGRAM_API_ID:-}" \
+      TELEGRAM_API_HASH="${TELEGRAM_API_HASH:-}" \
+      CALL_TELEGRAM_LOGOUT="${CALL_TELEGRAM_LOGOUT:-}" \
+      bash "$0" "$@"
   fi
 }
 
@@ -119,6 +124,40 @@ normalize_and_validate_credentials() {
   if [[ -z "${TELEGRAM_API_HASH}" || "${TELEGRAM_API_HASH}" =~ [[:space:]] ]]; then
     die "TELEGRAM_API_HASH must be a non-empty string without spaces."
   fi
+}
+
+credentials_are_valid() {
+  local bot_token api_id api_hash
+  bot_token="$(trim_value "${XVIDEO_BOT_TOKEN}")"
+  api_id="$(trim_value "${TELEGRAM_API_ID}")"
+  api_hash="$(trim_value "${TELEGRAM_API_HASH}")"
+
+  [[ "${bot_token}" =~ ^[0-9]+:[A-Za-z0-9_-]{20,}$ ]] || return 1
+  [[ "${api_id}" =~ ^[0-9]+$ ]] || return 1
+  [[ -n "${api_hash}" && ! "${api_hash}" =~ [[:space:]] ]] || return 1
+  return 0
+}
+
+prompt_credentials_until_valid() {
+  while true; do
+    prompt_value XVIDEO_BOT_TOKEN "Telegram bot token from BotFather" 1
+    prompt_value TELEGRAM_API_ID "Telegram application api_id from my.telegram.org" 0
+    prompt_value TELEGRAM_API_HASH "Telegram application api_hash from my.telegram.org" 1
+
+    if credentials_are_valid; then
+      normalize_and_validate_credentials
+      return
+    fi
+
+    if [[ ! -t 0 ]]; then
+      normalize_and_validate_credentials
+    fi
+
+    log "Existing credentials are invalid. Please re-enter them."
+    XVIDEO_BOT_TOKEN=""
+    TELEGRAM_API_ID=""
+    TELEGRAM_API_HASH=""
+  done
 }
 
 escape_env_value() {
@@ -296,10 +335,7 @@ main() {
   require_root "$@"
   load_existing_env
 
-  prompt_value XVIDEO_BOT_TOKEN "Telegram bot token from BotFather" 1
-  prompt_value TELEGRAM_API_ID "Telegram application api_id from my.telegram.org" 0
-  prompt_value TELEGRAM_API_HASH "Telegram application api_hash from my.telegram.org" 1
-  normalize_and_validate_credentials
+  prompt_credentials_until_valid
 
   install_packages
   install_app_user_and_files

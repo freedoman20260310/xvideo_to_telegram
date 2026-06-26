@@ -19,6 +19,15 @@ The installer stores them in `/etc/xvideo-to-telegram.env` with mode `600`.
 
 If `/getMe` returns HTTP `404`, the bot token is wrong or was copied with extra characters. The token must be the full BotFather value, for example `123456789:AA...`, not the bot username and not the `api_hash`.
 
+If a bad token was already written to `/etc/xvideo-to-telegram.env`, rerun the installer and it will ask again. You can also override it in one command:
+
+```bash
+sudo XVIDEO_BOT_TOKEN='123456789:AA...' \
+TELEGRAM_API_ID='123456' \
+TELEGRAM_API_HASH='abcdef123456' \
+./deploy_ec2.sh
+```
+
 Upload progress pacing can be tuned in the same env file:
 
 - `XVIDEO_LOCAL_UPLOAD_PROGRESS_CAP`: percent reserved for submitting the file to the local Bot API server, default `12`
