@@ -36,8 +36,10 @@ TOKEN = os.environ.get("XVIDEO_BOT_TOKEN")
 # ────────────────────────────────────────────────────────────────
 # PATHS
 # ────────────────────────────────────────────────────────────────
-LOG_FILE = os.path.expanduser("~/.hermes/scripts/xvideo_to_telegram_bot.log")
-STAGING_DIR = "/tmp/xvideo-dl"                          # yt-dlp target, deleted after send
+LOG_FILE = os.path.expanduser(
+    os.environ.get("XVIDEO_LOG_FILE", "~/.hermes/scripts/xvideo_to_telegram_bot.log")
+)
+STAGING_DIR = os.environ.get("XVIDEO_STAGING_DIR", "/tmp/xvideo-dl")
 
 # Telegram Bot API base URL.
 # Default: official api.telegram.org (50MB upload cap via sendVideo).
@@ -61,6 +63,7 @@ URL_RE = re.compile(
 # ────────────────────────────────────────────────────────────────
 # Logging — FileHandler so failures leave a trail even when detached
 # ────────────────────────────────────────────────────────────────
+Path(LOG_FILE).parent.mkdir(parents=True, exist_ok=True)
 _fh = logging.FileHandler(LOG_FILE)
 _fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
 log.addHandler(_fh)

@@ -68,3 +68,32 @@ systemctl restart xvideo-to-telegram.service
 ```
 
 The app is installed under `/opt/xvideo-to-telegram`. Temporary videos are staged in `/tmp/xvideo-dl` and removed after each job.
+
+## Add Another Bot
+
+The local Telegram Bot API service is shared. To add another bot, create only a new bot instance:
+
+```bash
+sudo ./add_ec2_bot.sh bot2
+```
+
+The script asks for the new BotFather token, writes `/etc/xvideo-to-telegram/bot2.env`, and starts:
+
+```bash
+xvideo-to-telegram@bot2.service
+```
+
+Non-interactive:
+
+```bash
+sudo BOT_NAME='bot2' \
+XVIDEO_BOT_TOKEN='123456789:AA...' \
+./add_ec2_bot.sh
+```
+
+Each bot gets its own staging directory and log file:
+
+```text
+/tmp/xvideo-dl-bot2
+/var/log/xvideo-to-telegram/bot2.log
+```
