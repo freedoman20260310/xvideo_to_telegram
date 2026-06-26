@@ -42,11 +42,23 @@ require_root() {
 }
 
 load_existing_env() {
+  local input_bot_token="${XVIDEO_BOT_TOKEN:-}"
+  local input_api_id="${TELEGRAM_API_ID:-}"
+  local input_api_hash="${TELEGRAM_API_HASH:-}"
   if [[ -f "${ENV_FILE}" ]]; then
     # shellcheck disable=SC1090
     set -a
     source "${ENV_FILE}"
     set +a
+  fi
+  if [[ -n "${input_bot_token}" ]]; then
+    XVIDEO_BOT_TOKEN="${input_bot_token}"
+  fi
+  if [[ -n "${input_api_id}" ]]; then
+    TELEGRAM_API_ID="${input_api_id}"
+  fi
+  if [[ -n "${input_api_hash}" ]]; then
+    TELEGRAM_API_HASH="${input_api_hash}"
   fi
   XVIDEO_BOT_TOKEN="${XVIDEO_BOT_TOKEN:-}"
   TELEGRAM_API_ID="${TELEGRAM_API_ID:-}"
@@ -77,6 +89,36 @@ prompt_value() {
     fi
   done
   printf -v "${var_name}" '%s' "${value}"
+}
+
+trim_value() {
+  local value="$1"
+  value="${value//$'\r'/}"
+  value="${value//$'\n'/}"
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+  if [[ "${value}" == \"*\" && "${value}" == *\" ]]; then
+    value="${value:1:${#value}-2}"
+  elif [[ "${value}" == \'*\' && "${value}" == *\' ]]; then
+    value="${value:1:${#value}-2}"
+  fi
+  printf '%s' "${value}"
+}
+
+normalize_and_validate_credentials() {
+  XVIDEO_BOT_TOKEN="$(trim_value "${XVIDEO_BOT_TOKEN}")"
+  TELEGRAM_API_ID="$(trim_value "${TELEGRAM_API_ID}")"
+  TELEGRAM_API_HASH="$(trim_value "${TELEGRAM_API_HASH}")"
+
+  if [[ ! "${XVIDEO_BOT_TOKEN}" =~ ^[0-9]+:[A-Za-z0-9_-]{20,}$ ]]; then
+    die "XVIDEO_BOT_TOKEN does not look like a BotFather token. Expected something like 123456789:AA..., with no quotes or spaces."
+  fi
+  if [[ ! "${TELEGRAM_API_ID}" =~ ^[0-9]+$ ]]; then
+    die "TELEGRAM_API_ID must be numeric."
+  fi
+  if [[ -z "${TELEGRAM_API_HASH}" || "${TELEGRAM_API_HASH}" =~ [[:space:]] ]]; then
+    die "TELEGRAM_API_HASH must be a non-empty string without spaces."
+  fi
 }
 
 escape_env_value() {
@@ -203,14 +245,29 @@ EOF
 
 smoke_test_token() {
   local url="https://api.telegram.org/bot${XVIDEO_BOT_TOKEN}/getMe"
+  local response_file http_code
   log "Smoke-testing bot token against official Telegram API"
-  curl -fsS --max-time 20 "${url}" | python3 -c '
+  response_file="$(mktemp)"
+  http_code="$(curl -sS --max-time 20 -o "${response_file}" -w '%{http_code}' "${url}" || true)"
+  if [[ "${http_code}" != "200" ]]; then
+    local body
+    body="$(head -c 500 "${response_file}" | tr '\n' ' ')"
+    rm -f "${response_file}"
+    die "Official Telegram /getMe returned HTTP ${http_code}. Check XVIDEO_BOT_TOKEN. Response: ${body:-<empty>}"
+  fi
+  if ! python3 - "${response_file}" <<'PY'
 import json, sys
-d=json.load(sys.stdin)
+with open(sys.argv[1], "r", encoding="utf-8") as f:
+    d=json.load(f)
 if not d.get("ok"):
-    raise SystemExit("getMe returned ok=false")
+    raise SystemExit(f"getMe returned ok=false: {d}")
 print("Bot:", d.get("result", {}).get("username", "unknown"))
-'
+PY
+  then
+    rm -f "${response_file}"
+    die "Could not parse official Telegram /getMe response. Check network access and XVIDEO_BOT_TOKEN."
+  fi
+  rm -f "${response_file}"
 }
 
 maybe_logout_cloud_api() {
@@ -242,6 +299,7 @@ main() {
   prompt_value XVIDEO_BOT_TOKEN "Telegram bot token from BotFather" 1
   prompt_value TELEGRAM_API_ID "Telegram application api_id from my.telegram.org" 0
   prompt_value TELEGRAM_API_HASH "Telegram application api_hash from my.telegram.org" 1
+  normalize_and_validate_credentials
 
   install_packages
   install_app_user_and_files
