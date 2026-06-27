@@ -22,6 +22,10 @@ BOT_API_PORT="${BOT_API_PORT:-8081}"
 UPLOAD_TIMEOUT="${XVIDEO_UPLOAD_TIMEOUT:-1800}"
 LOCAL_UPLOAD_CAP="${XVIDEO_LOCAL_UPLOAD_PROGRESS_CAP:-12}"
 TELEGRAM_UPLOAD_EST_MBPS="${XVIDEO_TELEGRAM_UPLOAD_EST_MBPS:-0.35}"
+COOKIES_FILE="${XVIDEO_COOKIES_FILE:-/var/lib/xvideo-to-telegram/x-cookies.txt}"
+ADMIN_CHAT_IDS="${XVIDEO_ADMIN_CHAT_IDS:-}"
+COOKIE_MAX_BYTES="${XVIDEO_COOKIE_MAX_BYTES:-2097152}"
+STAGING_DIR="${XVIDEO_STAGING_DIR:-/var/lib/xvideo-to-telegram/staging/default}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BOT_SOURCE="${BOT_SOURCE:-${SCRIPT_DIR}/xvideo_to_telegram_bot.py}"
@@ -41,6 +45,11 @@ require_root() {
       XVIDEO_BOT_TOKEN="${XVIDEO_BOT_TOKEN:-}" \
       TELEGRAM_API_ID="${TELEGRAM_API_ID:-}" \
       TELEGRAM_API_HASH="${TELEGRAM_API_HASH:-}" \
+      XVIDEO_ADMIN_CHAT_IDS="${XVIDEO_ADMIN_CHAT_IDS:-}" \
+      XVIDEO_COOKIES_FILE="${XVIDEO_COOKIES_FILE:-}" \
+      XVIDEO_COOKIE_MAX_BYTES="${XVIDEO_COOKIE_MAX_BYTES:-}" \
+      XVIDEO_STAGING_DIR="${XVIDEO_STAGING_DIR:-}" \
+      FFMPEG_BIN="${FFMPEG_BIN:-}" \
       CALL_TELEGRAM_LOGOUT="${CALL_TELEGRAM_LOGOUT:-}" \
       bash "$0" "$@"
   fi
@@ -50,6 +59,10 @@ load_existing_env() {
   local input_bot_token="${XVIDEO_BOT_TOKEN:-}"
   local input_api_id="${TELEGRAM_API_ID:-}"
   local input_api_hash="${TELEGRAM_API_HASH:-}"
+  local input_admin_chat_ids="${XVIDEO_ADMIN_CHAT_IDS:-}"
+  local input_cookies_file="${XVIDEO_COOKIES_FILE:-}"
+  local input_cookie_max_bytes="${XVIDEO_COOKIE_MAX_BYTES:-}"
+  local input_staging_dir="${XVIDEO_STAGING_DIR:-}"
   if [[ -f "${ENV_FILE}" ]]; then
     # shellcheck disable=SC1090
     set -a
@@ -65,9 +78,25 @@ load_existing_env() {
   if [[ -n "${input_api_hash}" ]]; then
     TELEGRAM_API_HASH="${input_api_hash}"
   fi
+  if [[ -n "${input_admin_chat_ids}" ]]; then
+    XVIDEO_ADMIN_CHAT_IDS="${input_admin_chat_ids}"
+  fi
+  if [[ -n "${input_cookies_file}" ]]; then
+    XVIDEO_COOKIES_FILE="${input_cookies_file}"
+  fi
+  if [[ -n "${input_cookie_max_bytes}" ]]; then
+    XVIDEO_COOKIE_MAX_BYTES="${input_cookie_max_bytes}"
+  fi
+  if [[ -n "${input_staging_dir}" ]]; then
+    XVIDEO_STAGING_DIR="${input_staging_dir}"
+  fi
   XVIDEO_BOT_TOKEN="${XVIDEO_BOT_TOKEN:-}"
   TELEGRAM_API_ID="${TELEGRAM_API_ID:-}"
   TELEGRAM_API_HASH="${TELEGRAM_API_HASH:-}"
+  XVIDEO_ADMIN_CHAT_IDS="${XVIDEO_ADMIN_CHAT_IDS:-${ADMIN_CHAT_IDS}}"
+  XVIDEO_COOKIES_FILE="${XVIDEO_COOKIES_FILE:-${COOKIES_FILE}}"
+  XVIDEO_COOKIE_MAX_BYTES="${XVIDEO_COOKIE_MAX_BYTES:-${COOKIE_MAX_BYTES}}"
+  XVIDEO_STAGING_DIR="${XVIDEO_STAGING_DIR:-${STAGING_DIR}}"
 }
 
 prompt_value() {
@@ -96,6 +125,24 @@ prompt_value() {
   printf -v "${var_name}" '%s' "${value}"
 }
 
+prompt_optional_value() {
+  local var_name="$1"
+  local label="$2"
+  local current="${!var_name:-}"
+
+  if [[ -n "${current}" ]]; then
+    log "Using existing ${var_name}"
+    return
+  fi
+  if [[ ! -t 0 ]]; then
+    return
+  fi
+
+  local value=""
+  read -r -p "${label} (optional): " value
+  printf -v "${var_name}" '%s' "${value}"
+}
+
 trim_value() {
   local value="$1"
   value="${value//$'\r'/}"
@@ -108,6 +155,26 @@ trim_value() {
     value="${value:1:${#value}-2}"
   fi
   printf '%s' "${value}"
+}
+
+normalize_optional_settings() {
+  XVIDEO_ADMIN_CHAT_IDS="$(trim_value "${XVIDEO_ADMIN_CHAT_IDS:-${ADMIN_CHAT_IDS}}")"
+  XVIDEO_COOKIES_FILE="$(trim_value "${XVIDEO_COOKIES_FILE:-${COOKIES_FILE}}")"
+  XVIDEO_COOKIE_MAX_BYTES="$(trim_value "${XVIDEO_COOKIE_MAX_BYTES:-${COOKIE_MAX_BYTES}}")"
+  XVIDEO_STAGING_DIR="$(trim_value "${XVIDEO_STAGING_DIR:-${STAGING_DIR}}")"
+
+  if [[ -z "${XVIDEO_COOKIES_FILE}" ]]; then
+    XVIDEO_COOKIES_FILE="/var/lib/xvideo-to-telegram/x-cookies.txt"
+  fi
+  if [[ -z "${XVIDEO_STAGING_DIR}" ]]; then
+    XVIDEO_STAGING_DIR="/var/lib/xvideo-to-telegram/staging/default"
+  fi
+  if [[ ! "${XVIDEO_COOKIE_MAX_BYTES}" =~ ^[0-9]+$ ]]; then
+    die "XVIDEO_COOKIE_MAX_BYTES must be numeric."
+  fi
+  if [[ -n "${XVIDEO_ADMIN_CHAT_IDS}" ]] && ! grep -Eq '^[-0-9,[:space:];]+$' <<<"${XVIDEO_ADMIN_CHAT_IDS}"; then
+    die "XVIDEO_ADMIN_CHAT_IDS must contain only Telegram numeric IDs separated by commas, semicolons, or spaces."
+  fi
 }
 
 normalize_and_validate_credentials() {
@@ -198,7 +265,8 @@ install_app_user_and_files() {
 
   install -d -m 755 -o "${APP_USER}" -g "${APP_USER}" "${APP_SRC_DIR}"
   install -d -m 755 -o "${APP_USER}" -g "${APP_USER}" "${APP_DIR}/.hermes/scripts"
-  install -d -m 755 -o "${APP_USER}" -g "${APP_USER}" /tmp/xvideo-dl
+  install -d -m 755 -o "${APP_USER}" -g "${APP_USER}" "${XVIDEO_STAGING_DIR}"
+  install -d -m 700 -o "${APP_USER}" -g "${APP_USER}" "$(dirname "${XVIDEO_COOKIES_FILE}")"
   install -m 755 -o "${APP_USER}" -g "${APP_USER}" "${BOT_SOURCE}" "${APP_SRC_DIR}/xvideo_to_telegram_bot.py"
 
   python3 -m venv "${APP_DIR}/venv"
@@ -216,11 +284,16 @@ write_env_file() {
     printf 'TELEGRAM_BOT_API_IMAGE=%s\n' "$(escape_env_value "${TELEGRAM_BOT_API_IMAGE}")"
     printf 'BOT_API_BASE_URL=%s\n' "$(escape_env_value "http://127.0.0.1:${BOT_API_PORT}")"
     printf 'YT_DLP_BIN=%s\n' "$(escape_env_value "${APP_DIR}/venv/bin/yt-dlp")"
+    printf 'FFMPEG_BIN=%s\n' "$(escape_env_value "/usr/bin/ffmpeg")"
     printf 'FFPROBE_BIN=%s\n' "$(escape_env_value "/usr/bin/ffprobe")"
     printf 'CURL_BIN=%s\n' "$(escape_env_value "/usr/bin/curl")"
     printf 'XVIDEO_UPLOAD_TIMEOUT=%s\n' "$(escape_env_value "${UPLOAD_TIMEOUT}")"
     printf 'XVIDEO_LOCAL_UPLOAD_PROGRESS_CAP=%s\n' "$(escape_env_value "${LOCAL_UPLOAD_CAP}")"
     printf 'XVIDEO_TELEGRAM_UPLOAD_EST_MBPS=%s\n' "$(escape_env_value "${TELEGRAM_UPLOAD_EST_MBPS}")"
+    printf 'XVIDEO_COOKIES_FILE=%s\n' "$(escape_env_value "${XVIDEO_COOKIES_FILE}")"
+    printf 'XVIDEO_ADMIN_CHAT_IDS=%s\n' "$(escape_env_value "${XVIDEO_ADMIN_CHAT_IDS}")"
+    printf 'XVIDEO_COOKIE_MAX_BYTES=%s\n' "$(escape_env_value "${XVIDEO_COOKIE_MAX_BYTES}")"
+    printf 'XVIDEO_STAGING_DIR=%s\n' "$(escape_env_value "${XVIDEO_STAGING_DIR}")"
   } > "${ENV_FILE}"
 }
 
@@ -336,6 +409,8 @@ main() {
   load_existing_env
 
   prompt_credentials_until_valid
+  prompt_optional_value XVIDEO_ADMIN_CHAT_IDS "Admin Telegram user/chat IDs for cookie upload"
+  normalize_optional_settings
 
   install_packages
   install_app_user_and_files

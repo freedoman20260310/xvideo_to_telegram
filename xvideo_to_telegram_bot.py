@@ -22,8 +22,10 @@ import logging
 import subprocess
 import threading
 import uuid
+import tempfile
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from urllib.parse import quote
 
 import httpx
 
@@ -40,6 +42,18 @@ LOG_FILE = os.path.expanduser(
     os.environ.get("XVIDEO_LOG_FILE", "~/.hermes/scripts/xvideo_to_telegram_bot.log")
 )
 STAGING_DIR = os.environ.get("XVIDEO_STAGING_DIR", "/tmp/xvideo-dl")
+COOKIES_FILE = os.path.expanduser(os.environ.get("XVIDEO_COOKIES_FILE", "").strip())
+ADMIN_CHAT_IDS_RAW = os.environ.get("XVIDEO_ADMIN_CHAT_IDS", "").strip()
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, str(default)))
+    except ValueError:
+        return default
+
+
+COOKIE_MAX_BYTES = _env_int("XVIDEO_COOKIE_MAX_BYTES", 2 * 1024 * 1024)
 
 # Telegram Bot API base URL.
 # Default: official api.telegram.org (50MB upload cap via sendVideo).
@@ -80,10 +94,51 @@ FETCH_POOL = ThreadPoolExecutor(max_workers=1, thread_name_prefix="xvideo-fetch"
 # yt-dlp path. macOS launchd can keep using Homebrew; Linux/systemd sets YT_DLP_BIN.
 YT_DLP = os.environ.get("YT_DLP_BIN") or os.environ.get("YT_DLP") or "/opt/homebrew/bin/yt-dlp"
 CURL = os.environ.get("CURL_BIN", "curl")
+FFMPEG = os.environ.get("FFMPEG_BIN", "ffmpeg")
 FFPROBE = os.environ.get("FFPROBE_BIN", "ffprobe")
 UPLOAD_TIMEOUT = int(os.environ.get("XVIDEO_UPLOAD_TIMEOUT", "1800"))
 LOCAL_BOT_API_UPLOAD_CAP = float(os.environ.get("XVIDEO_LOCAL_UPLOAD_PROGRESS_CAP", "12"))
 TELEGRAM_UPLOAD_EST_MBPS = float(os.environ.get("XVIDEO_TELEGRAM_UPLOAD_EST_MBPS", "0.35"))
+THUMBNAIL_MAX_BYTES = 200 * 1024
+SEND_VIDEO_COVER = os.environ.get("XVIDEO_SEND_VIDEO_COVER", "1").lower() not in ("0", "false", "no")
+
+
+def _parse_id_set(raw: str) -> set[int]:
+    ids: set[int] = set()
+    for item in re.split(r"[,;\s]+", raw or ""):
+        if not item:
+            continue
+        try:
+            ids.add(int(item))
+        except ValueError:
+            log.warning("ignoring invalid XVIDEO_ADMIN_CHAT_IDS item: %r", item)
+    return ids
+
+
+ADMIN_CHAT_IDS = _parse_id_set(ADMIN_CHAT_IDS_RAW)
+
+
+def _cookies_path() -> Path | None:
+    if not COOKIES_FILE:
+        return None
+    return Path(COOKIES_FILE).expanduser()
+
+
+def _cookies_are_usable() -> bool:
+    path = _cookies_path()
+    return bool(path and path.is_file() and os.access(path, os.R_OK))
+
+
+def _yt_dlp_base_cmd() -> list[str]:
+    cmd = [YT_DLP, "--no-warnings", "--no-update"]
+    path = _cookies_path()
+    if not path:
+        return cmd
+    if path.is_file() and os.access(path, os.R_OK):
+        cmd.extend(["--cookies", str(path)])
+    else:
+        log.info("XVIDEO_COOKIES_FILE is configured but not readable yet: %s; using guest mode", path)
+    return cmd
 
 
 # ================================================================
@@ -118,6 +173,268 @@ def send_video_or_document(client: httpx.Client, chat_id: int, filepath: str, ca
     implementation is sendVideo via curl, with video/mp4 MIME and metadata.
     """
     _upload_video_with_progress(chat_id, filepath, caption, progress=None)
+
+
+def _message_actor_ids(msg: dict) -> set[int]:
+    ids: set[int] = set()
+    chat_id = msg.get("chat", {}).get("id")
+    from_id = msg.get("from", {}).get("id")
+    for value in (chat_id, from_id):
+        if isinstance(value, int):
+            ids.add(value)
+    return ids
+
+
+def _is_admin_message(msg: dict) -> bool:
+    return bool(ADMIN_CHAT_IDS and (ADMIN_CHAT_IDS & _message_actor_ids(msg)))
+
+
+def _require_admin(msg: dict, client: httpx.Client) -> bool:
+    if _is_admin_message(msg):
+        return True
+    chat_id = msg.get("chat", {}).get("id")
+    if chat_id:
+        if not ADMIN_CHAT_IDS:
+            send_message(
+                client,
+                chat_id,
+                "🔒 Cookie 管理还没有配置管理员。\n"
+                "先发送 /id 获取你的 user_id，然后把它写入 XVIDEO_ADMIN_CHAT_IDS。",
+            )
+        else:
+            send_message(client, chat_id, "⛔ 只有管理员可以管理 X cookies。")
+    return False
+
+
+def _download_telegram_file(client: httpx.Client, file_id: str, max_bytes: int) -> bytes:
+    meta = client.get(
+        f"{API_BASE}/bot{TOKEN}/getFile",
+        params={"file_id": file_id},
+        timeout=30,
+    )
+    meta.raise_for_status()
+    body = meta.json()
+    if not body.get("ok"):
+        raise RuntimeError(f"getFile failed: {body}")
+
+    file_path = (body.get("result") or {}).get("file_path")
+    if not file_path:
+        raise RuntimeError("getFile did not return file_path")
+
+    if os.path.isabs(file_path) and os.path.isfile(file_path):
+        size = os.path.getsize(file_path)
+        if size > max_bytes:
+            raise ValueError(f"cookie file too large: {size} bytes")
+        return Path(file_path).read_bytes()
+
+    file_url = f"{API_BASE}/file/bot{TOKEN}/{quote(file_path, safe='/')}"
+    chunks: list[bytes] = []
+    total = 0
+    with client.stream("GET", file_url, timeout=60) as response:
+        response.raise_for_status()
+        for chunk in response.iter_bytes():
+            if not chunk:
+                continue
+            total += len(chunk)
+            if total > max_bytes:
+                raise ValueError(f"cookie file too large: {total} bytes")
+            chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def _analyze_cookies_text(text: str) -> tuple[bool, str, dict]:
+    if "\x00" in text:
+        return False, "文件里包含二进制内容，看起来不是 cookies.txt。", {}
+    if not text.strip():
+        return False, "文件是空的。", {}
+
+    cookie_rows = 0
+    x_rows = 0
+    invalid_rows = 0
+    names: set[str] = set()
+    domains: set[str] = set()
+
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.startswith("#HttpOnly_"):
+            line = line[len("#HttpOnly_"):]
+        elif line.startswith("#"):
+            continue
+
+        parts = line.split("\t")
+        if len(parts) != 7:
+            invalid_rows += 1
+            continue
+
+        domain = parts[0].strip().lower()
+        name = parts[5].strip()
+        if not domain or not name:
+            invalid_rows += 1
+            continue
+
+        cookie_rows += 1
+        normalized_domain = domain.lstrip(".")
+        is_x_domain = (
+            normalized_domain == "x.com"
+            or normalized_domain.endswith(".x.com")
+            or normalized_domain == "twitter.com"
+            or normalized_domain.endswith(".twitter.com")
+        )
+        if is_x_domain:
+            x_rows += 1
+            domains.add(normalized_domain)
+            names.add(name)
+
+    if cookie_rows == 0:
+        return False, "没有找到 Netscape cookies.txt 格式的 cookie 行。", {}
+    if x_rows == 0:
+        return False, "文件里没有 x.com / twitter.com 的 cookie。", {
+            "cookie_rows": cookie_rows,
+            "invalid_rows": invalid_rows,
+        }
+
+    warnings = []
+    if not {"auth_token", "ct0"} & names:
+        warnings.append("没有发现 auth_token 或 ct0，可能仍然无法访问登录受限推文")
+
+    return True, "ok", {
+        "cookie_rows": cookie_rows,
+        "x_rows": x_rows,
+        "invalid_rows": invalid_rows,
+        "domains": sorted(domains),
+        "has_auth_token": "auth_token" in names,
+        "has_ct0": "ct0" in names,
+        "warnings": warnings,
+    }
+
+
+def _save_cookies_text(text: str) -> Path:
+    path = _cookies_path()
+    if not path:
+        raise RuntimeError("XVIDEO_COOKIES_FILE is not configured")
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
+            f.write(text.rstrip("\n") + "\n")
+        os.chmod(tmp_name, 0o600)
+        os.replace(tmp_name, path)
+        os.chmod(path, 0o600)
+    except Exception:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+    return path
+
+
+def _cookie_status_text() -> str:
+    path = _cookies_path()
+    if not path:
+        return (
+            "🍪 Cookie 文件路径未配置。\n"
+            "请在环境变量里设置 XVIDEO_COOKIES_FILE，重启 bot 后再上传 cookies.txt。"
+        )
+    if not path.exists():
+        return (
+            "🍪 还没有上传 X cookies。\n"
+            f"当前会以游客模式解析 X。\n"
+            f"保存位置：{path}"
+        )
+    if not path.is_file():
+        return f"⚠️ Cookie 路径存在但不是文件：{path}"
+
+    try:
+        stat = path.stat()
+        text = path.read_text(encoding="utf-8", errors="replace")
+        ok, message, info = _analyze_cookies_text(text)
+        mtime = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(stat.st_mtime))
+        if not ok:
+            return (
+                "⚠️ Cookie 文件存在，但格式校验未通过。\n"
+                f"原因：{message}\n"
+                f"路径：{path}"
+            )
+        auth = []
+        if info.get("has_auth_token"):
+            auth.append("auth_token")
+        if info.get("has_ct0"):
+            auth.append("ct0")
+        auth_text = ", ".join(auth) if auth else "未发现关键登录 cookie"
+        lines = [
+            "🍪 X cookies 已启用",
+            f"大小：{stat.st_size / 1024:.1f} KB",
+            f"更新时间：{mtime}",
+            f"X/Twitter cookie 行：{info.get('x_rows', 0)}",
+            f"关键项：{auth_text}",
+        ]
+        warnings = info.get("warnings") or []
+        if warnings:
+            lines.append("提示：" + "；".join(warnings))
+        return "\n".join(lines)
+    except Exception as e:
+        return f"⚠️ 无法读取 cookie 文件：{type(e).__name__}: {e}"
+
+
+def _handle_cookie_document(msg: dict, client: httpx.Client) -> None:
+    chat_id = msg.get("chat", {}).get("id")
+    if not chat_id:
+        return
+    if not _require_admin(msg, client):
+        return
+
+    path = _cookies_path()
+    if not path:
+        send_message(
+            client,
+            chat_id,
+            "⚠️ 还没有配置 XVIDEO_COOKIES_FILE，无法保存 cookie 文件。",
+        )
+        return
+
+    document = msg.get("document") or {}
+    filename = document.get("file_name") or "cookies.txt"
+    file_id = document.get("file_id")
+    file_size = int(document.get("file_size") or 0)
+    if not file_id:
+        send_message(client, chat_id, "⚠️ 这个文件没有 file_id，无法下载。")
+        return
+    if file_size and file_size > COOKIE_MAX_BYTES:
+        send_message(client, chat_id, f"⚠️ 文件太大，cookie 文件上限是 {COOKIE_MAX_BYTES // 1024} KB。")
+        return
+
+    try:
+        data = _download_telegram_file(client, file_id, COOKIE_MAX_BYTES)
+        try:
+            text = data.decode("utf-8-sig")
+        except UnicodeDecodeError:
+            text = data.decode("latin-1")
+
+        ok, message, info = _analyze_cookies_text(text)
+        if not ok:
+            send_message(client, chat_id, f"❌ Cookie 文件校验失败：{message}")
+            return
+
+        saved = _save_cookies_text(text)
+        warnings = info.get("warnings") or []
+        lines = [
+            "✅ 已保存 X cookies",
+            f"文件名：{filename}",
+            f"X/Twitter cookie 行：{info.get('x_rows', 0)}",
+            f"路径：{saved}",
+            "后续下载会自动使用登录态；文件缺失时仍会回退游客模式。",
+        ]
+        if warnings:
+            lines.append("提示：" + "；".join(warnings))
+        send_message(client, chat_id, "\n".join(lines))
+        log.info("updated X cookies from Telegram document %s (%d bytes)", filename, len(data))
+    except Exception as e:
+        log.exception("cookie upload failed: %s", e)
+        send_message(client, chat_id, f"❌ 保存 cookie 失败：{type(e).__name__}: {e}")
 
 
 # ================================================================
@@ -189,6 +506,12 @@ def _format_elapsed(seconds: float) -> str:
     if hours:
         return f"{hours:d}:{mins:02d}:{secs:02d}"
     return f"{mins:d}:{secs:02d}"
+
+
+def _format_duration(seconds: int | float | None) -> str:
+    if not seconds:
+        return ""
+    return _format_elapsed(float(seconds))
 
 
 def _clamp(n: float, low: float, high: float) -> float:
@@ -375,12 +698,13 @@ class ProgressReporter:
     def _flush(self) -> None:
         # Build a clean single-message status with a progress bar
         with self._lock:
-            bar_len = 20
+            bar_len = 12
             filled = int(self.latest_pct / 100 * bar_len)
             bar = "█" * filled + "░" * (bar_len - filled)
+            pct_text = "100%" if self.latest_pct >= 99.95 else f"{self.latest_pct:.1f}%"
             lines = [
-                f"{self.label_emoji} {self.label_phase}… {self.latest_pct:5.1f}%",
-                f"[{bar}]",
+                f"{self.label_emoji} {self.label_phase}",
+                f"[{bar}] {pct_text}",
             ]
             if self.latest_size_str:
                 lines.append(f"📦 {self.latest_size_str}")
@@ -444,8 +768,106 @@ def _probe_video_metadata(filepath: str) -> dict[str, int]:
         return {}
 
 
-def _build_send_video_curl_cmd(chat_id: int, filepath: str, caption: str = "") -> list[str]:
-    metadata = _probe_video_metadata(filepath)
+def _video_detail_text(size_bytes: int, metadata: dict[str, int]) -> str:
+    details = []
+    duration = _format_duration(metadata.get("duration"))
+    if duration:
+        details.append(f"⏱ {duration}")
+    width = metadata.get("width")
+    height = metadata.get("height")
+    if width and height:
+        details.append(f"🖼 {width}x{height}")
+    details.append(f"💾 {_format_size_mb(size_bytes)}")
+    return " · ".join(details)
+
+
+def _build_video_caption(url: str, size_bytes: int, metadata: dict[str, int]) -> str:
+    details = _video_detail_text(size_bytes, metadata)
+    lines = ["🎬 X 视频"]
+    if details:
+        lines.append(details)
+    lines.append(f"🔗 {url}")
+    return "\n".join(lines)[:1024]
+
+
+def _thumbnail_seek_seconds(metadata: dict[str, int]) -> float:
+    duration = metadata.get("duration") or 0
+    if duration <= 1:
+        return 0.0
+    return min(max(duration * 0.12, 3.0), max(duration - 1, 0))
+
+
+def _generate_video_thumbnail(filepath: str, metadata: dict[str, int]) -> str | None:
+    """
+    Best-effort custom thumbnail for Telegram sendVideo.
+
+    Telegram thumbnail uploads should be JPEG, <= 200KB, and no larger than
+    320px on either side. Failure is non-fatal; Telegram can still send the
+    video and generate its own preview.
+    """
+    source = Path(filepath)
+    if not source.is_file():
+        return None
+
+    thumb_path = str(source.with_suffix(".thumb.jpg"))
+    seek = _thumbnail_seek_seconds(metadata)
+    attempts = [
+        (320, 5),
+        (320, 8),
+        (240, 9),
+        (200, 10),
+    ]
+
+    for max_side, quality in attempts:
+        try:
+            if os.path.exists(thumb_path):
+                os.remove(thumb_path)
+            result = subprocess.run(
+                [
+                    FFMPEG, "-y", "-hide_banner", "-loglevel", "error",
+                    "-ss", f"{seek:.2f}",
+                    "-i", filepath,
+                    "-vf", f"thumbnail=50,scale={max_side}:{max_side}:force_original_aspect_ratio=decrease",
+                    "-frames:v", "1",
+                    "-q:v", str(quality),
+                    thumb_path,
+                ],
+                capture_output=True, text=True, timeout=45,
+            )
+            if result.returncode != 0:
+                log.warning("thumbnail ffmpeg failed for %s: %s", filepath, result.stderr[:300])
+                continue
+            if not os.path.isfile(thumb_path) or os.path.getsize(thumb_path) <= 0:
+                continue
+            size = os.path.getsize(thumb_path)
+            if size <= THUMBNAIL_MAX_BYTES:
+                log.info("generated thumbnail %s (%d bytes, seek %.2fs)", thumb_path, size, seek)
+                return thumb_path
+            log.info("thumbnail too large at %dpx/q%d: %d bytes", max_side, quality, size)
+        except FileNotFoundError:
+            log.warning("ffmpeg binary not found: %s", FFMPEG)
+            break
+        except Exception as e:
+            log.warning("thumbnail generation failed for %s: %s", filepath, e)
+
+    try:
+        if os.path.exists(thumb_path):
+            os.remove(thumb_path)
+    except OSError:
+        pass
+    return None
+
+
+def _build_send_video_curl_cmd(
+    chat_id: int,
+    filepath: str,
+    caption: str = "",
+    *,
+    metadata: dict[str, int] | None = None,
+    thumbnail_path: str | None = None,
+) -> list[str]:
+    if metadata is None:
+        metadata = _probe_video_metadata(filepath)
     cmd = [
         CURL,
         "--show-error", "--fail-with-body", "--progress-bar",
@@ -459,6 +881,10 @@ def _build_send_video_curl_cmd(chat_id: int, filepath: str, caption: str = "") -
     ]
     if caption:
         cmd.extend(["-F", f"caption={caption[:1024]}"])
+    if thumbnail_path and os.path.isfile(thumbnail_path):
+        cmd.extend(["-F", f"thumbnail=@{thumbnail_path};type=image/jpeg"])
+        if SEND_VIDEO_COVER:
+            cmd.extend(["-F", f"cover=@{thumbnail_path};type=image/jpeg"])
     for key in ("duration", "width", "height"):
         value = metadata.get(key)
         if value:
@@ -485,11 +911,14 @@ def _upload_video_with_progress(
     filepath: str,
     caption: str = "",
     progress: ProgressReporter | None = None,
+    metadata: dict[str, int] | None = None,
 ) -> dict | None:
     p = Path(filepath)
     if not p.is_file():
         raise FileNotFoundError(f"sendVideo: {filepath} missing")
     size = p.stat().st_size
+    if metadata is None:
+        metadata = _probe_video_metadata(filepath)
     TWO_GB = 2 * 1024 * 1024 * 1024
     if size > TWO_GB:
         raise ValueError(f"file too large for Telegram: {size} bytes (>2GB)")
@@ -504,10 +933,20 @@ def _upload_video_with_progress(
     log.info("sendVideo uploading %s (%d bytes / %.1f MB) to chat %s",
              p.name, size, size_mb, chat_id)
     if progress:
+        progress.set_phase("生成视频预览")
+        progress.update(0.0, size_str=_format_size_mb(size), force=True)
+    thumbnail_path = _generate_video_thumbnail(filepath, metadata)
+    if progress:
         progress.set_phase("提交到本地 Bot API")
         progress.update(0.0, size_str=_format_size_mb(size), force=True)
 
-    cmd = _build_send_video_curl_cmd(chat_id, filepath, caption)
+    cmd = _build_send_video_curl_cmd(
+        chat_id,
+        filepath,
+        caption,
+        metadata=metadata,
+        thumbnail_path=thumbnail_path,
+    )
     proc = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
@@ -681,12 +1120,15 @@ def fetch_and_save(url: str, chat_id: int, status_msg_id: int, client: httpx.Cli
         # Step 1 — quick format probe to confirm there's a video
         edit_message(client, chat_id, status_msg_id, f"⏳ 解析视频…\n{url}")
         probe = subprocess.run(
-            [YT_DLP, "--no-warnings", "--no-update", "-F", url],
+            [*_yt_dlp_base_cmd(), "-F", url],
             capture_output=True, text=True, timeout=60,
         )
         if probe.returncode != 0 or "Available formats" not in probe.stdout:
+            cookie_hint = ""
+            if not _cookies_are_usable():
+                cookie_hint = "\n\n提示：这个推文可能需要登录 X。管理员上传 cookies.txt 后可再试。"
             edit_message(client, chat_id, status_msg_id,
-                         f"❌ 没找到视频或解析失败\n{url}\n\n{probe.stderr.strip()[:200]}")
+                         f"❌ 没找到视频或解析失败\n{url}\n\n{probe.stderr.strip()[:200]}{cookie_hint}")
             log.warning("probe failed for %s: %s", url, probe.stderr[:200])
             return
 
@@ -786,7 +1228,7 @@ def fetch_and_save(url: str, chat_id: int, status_msg_id: int, client: httpx.Cli
         # video and audio streams separately.
         dl_proc = subprocess.Popen(
             [
-                YT_DLP, "--no-warnings", "--no-update", "--newline",
+                *_yt_dlp_base_cmd(), "--newline",
                 "--color", "no_color",
                 "--progress-template", _YT_DLP_PROGRESS_TEMPLATE,
                 "--progress-delta", "0.5",
@@ -860,8 +1302,9 @@ def fetch_and_save(url: str, chat_id: int, status_msg_id: int, client: httpx.Cli
             return
 
         size_bytes = os.path.getsize(staged_file)
-        size_mb = size_bytes / 1024 / 1024
         log.info("downloaded %s -> %s (%d bytes)", url, staged_file, size_bytes)
+        metadata = _probe_video_metadata(staged_file)
+        detail_text = _video_detail_text(size_bytes, metadata)
 
         # Step 3.5 — Telegram upload limit check.
         # Official api.telegram.org caps sendVideo at ~50MB.
@@ -880,12 +1323,15 @@ def fetch_and_save(url: str, chat_id: int, status_msg_id: int, client: httpx.Cli
             return
 
         # Step 4 — upload to Telegram with progress reporting.
-        caption = f"🎬 X 视频\n🔗 {url}\n💾 {size_mb:.1f} MB"
-        _upload_video_with_progress(chat_id, staged_file, caption, up_progress)
+        caption = _build_video_caption(url, size_bytes, metadata)
+        _upload_video_with_progress(chat_id, staged_file, caption, up_progress, metadata=metadata)
 
         # Step 5 — done
-        edit_message(client, chat_id, status_msg_id,
-                     f"✅ 已发送\n🎬 {Path(staged_file).name} ({size_mb:.1f} MB)\n🔗 {url}")
+        done_lines = ["✅ 已发送"]
+        if detail_text:
+            done_lines.append(detail_text)
+        done_lines.append(f"🔗 {url}")
+        edit_message(client, chat_id, status_msg_id, "\n".join(done_lines))
         log.info("delivered %s to chat %s", url, chat_id)
 
     except subprocess.TimeoutExpired:
@@ -926,11 +1372,16 @@ def handle_message(msg: dict, client: httpx.Client) -> None:
     chat_id = msg.get("chat", {}).get("id")
     if not chat_id:
         return
+
+    if msg.get("document"):
+        _handle_cookie_document(msg, client)
+        return
+
     text = (msg.get("text") or "").strip()
     if not text:
         return
 
-    # Slash commands — only /start and /help for one-time discoverability
+    # Slash commands — small command surface for help and cookie administration.
     if text.startswith("/"):
         cmd = text.split()[0].split("@")[0].lower()
         if cmd in ("/start", "/help"):
@@ -940,9 +1391,35 @@ def handle_message(msg: dict, client: httpx.Client) -> None:
                 "其他消息我安静忽略。\n\n"
                 "🎬 通过 sendVideo 发送 — 在聊天里显示视频预览。\n"
                 "📦 本地 Bot API 服务下最大 2GB。\n"
-                "⏳ 视频大时可能要等几分钟。"
+                "⏳ 视频大时可能要等几分钟。\n\n"
+                "管理员：发送 /id 查看自己的 ID；配置后可上传 cookies.txt，"
+                "并用 /cookie_status 或 /delete_cookie 管理 X 登录态。"
             )
             send_message(client, chat_id, HELP_TEXT)
+        elif cmd == "/id":
+            from_user = msg.get("from") or {}
+            send_message(
+                client,
+                chat_id,
+                f"chat_id: {chat_id}\nuser_id: {from_user.get('id', 'unknown')}",
+            )
+        elif cmd == "/cookie_status":
+            if _require_admin(msg, client):
+                send_message(client, chat_id, _cookie_status_text())
+        elif cmd == "/delete_cookie":
+            if _require_admin(msg, client):
+                path = _cookies_path()
+                if not path:
+                    send_message(client, chat_id, "🍪 Cookie 文件路径未配置。")
+                elif path.exists():
+                    try:
+                        path.unlink()
+                        send_message(client, chat_id, "✅ 已删除 X cookies，后续会回退游客模式。")
+                        log.info("deleted X cookies via Telegram command")
+                    except Exception as e:
+                        send_message(client, chat_id, f"❌ 删除失败：{type(e).__name__}: {e}")
+                else:
+                    send_message(client, chat_id, "🍪 当前没有已保存的 X cookies。")
         return
 
     # Trigger detection

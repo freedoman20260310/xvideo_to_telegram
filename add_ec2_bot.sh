@@ -18,6 +18,10 @@ BASE_ENV_FILE="${BASE_ENV_FILE:-/etc/xvideo-to-telegram.env}"
 BOT_API_SERVICE="${BOT_API_SERVICE:-telegram-bot-api.service}"
 TEMPLATE_SERVICE="xvideo-to-telegram@.service"
 BOT_SOURCE="${BOT_SOURCE:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/xvideo_to_telegram_bot.py}"
+COOKIES_FILE="${XVIDEO_COOKIES_FILE:-/var/lib/xvideo-to-telegram/x-cookies.txt}"
+ADMIN_CHAT_IDS="${XVIDEO_ADMIN_CHAT_IDS:-}"
+COOKIE_MAX_BYTES="${XVIDEO_COOKIE_MAX_BYTES:-2097152}"
+STAGING_BASE_DIR="${XVIDEO_STAGING_BASE_DIR:-/var/lib/xvideo-to-telegram/staging}"
 
 log() {
   printf '[%s:add-bot] %s\n' "$APP_NAME" "$*"
@@ -33,6 +37,12 @@ require_root() {
     exec sudo \
       BOT_NAME="${BOT_NAME:-}" \
       XVIDEO_BOT_TOKEN="${XVIDEO_BOT_TOKEN:-}" \
+      XVIDEO_ADMIN_CHAT_IDS="${XVIDEO_ADMIN_CHAT_IDS:-}" \
+      XVIDEO_COOKIES_FILE="${XVIDEO_COOKIES_FILE:-}" \
+      XVIDEO_COOKIE_MAX_BYTES="${XVIDEO_COOKIE_MAX_BYTES:-}" \
+      XVIDEO_STAGING_BASE_DIR="${XVIDEO_STAGING_BASE_DIR:-}" \
+      XVIDEO_STAGING_DIR="${XVIDEO_STAGING_DIR:-}" \
+      FFMPEG_BIN="${FFMPEG_BIN:-}" \
       OVERWRITE="${OVERWRITE:-}" \
       CALL_TELEGRAM_LOGOUT="${CALL_TELEGRAM_LOGOUT:-}" \
       bash "$0" "$@"
@@ -99,13 +109,23 @@ escape_env_value() {
 
 load_common_env() {
   local input_bot_token="${XVIDEO_BOT_TOKEN:-}"
+  local input_admin_chat_ids="${XVIDEO_ADMIN_CHAT_IDS:-}"
+  local input_cookies_file="${XVIDEO_COOKIES_FILE:-}"
+  local input_cookie_max_bytes="${XVIDEO_COOKIE_MAX_BYTES:-}"
+  local input_staging_base_dir="${XVIDEO_STAGING_BASE_DIR:-}"
+  local input_staging_dir="${XVIDEO_STAGING_DIR:-}"
   BOT_API_BASE_URL="${BOT_API_BASE_URL:-http://127.0.0.1:8081}"
   YT_DLP_BIN="${YT_DLP_BIN:-${APP_DIR}/venv/bin/yt-dlp}"
+  FFMPEG_BIN="${FFMPEG_BIN:-/usr/bin/ffmpeg}"
   FFPROBE_BIN="${FFPROBE_BIN:-/usr/bin/ffprobe}"
   CURL_BIN="${CURL_BIN:-/usr/bin/curl}"
   XVIDEO_UPLOAD_TIMEOUT="${XVIDEO_UPLOAD_TIMEOUT:-1800}"
   XVIDEO_LOCAL_UPLOAD_PROGRESS_CAP="${XVIDEO_LOCAL_UPLOAD_PROGRESS_CAP:-12}"
   XVIDEO_TELEGRAM_UPLOAD_EST_MBPS="${XVIDEO_TELEGRAM_UPLOAD_EST_MBPS:-0.35}"
+  XVIDEO_ADMIN_CHAT_IDS="${XVIDEO_ADMIN_CHAT_IDS:-${ADMIN_CHAT_IDS}}"
+  XVIDEO_COOKIES_FILE="${XVIDEO_COOKIES_FILE:-${COOKIES_FILE}}"
+  XVIDEO_COOKIE_MAX_BYTES="${XVIDEO_COOKIE_MAX_BYTES:-${COOKIE_MAX_BYTES}}"
+  XVIDEO_STAGING_BASE_DIR="${XVIDEO_STAGING_BASE_DIR:-${STAGING_BASE_DIR}}"
 
   if [[ -f "${BASE_ENV_FILE}" ]]; then
     # Read common values from the original deployment, but intentionally do not
@@ -116,13 +136,33 @@ load_common_env() {
     set +a
     BOT_API_BASE_URL="${BOT_API_BASE_URL:-http://127.0.0.1:8081}"
     YT_DLP_BIN="${YT_DLP_BIN:-${APP_DIR}/venv/bin/yt-dlp}"
+    FFMPEG_BIN="${FFMPEG_BIN:-/usr/bin/ffmpeg}"
     FFPROBE_BIN="${FFPROBE_BIN:-/usr/bin/ffprobe}"
     CURL_BIN="${CURL_BIN:-/usr/bin/curl}"
     XVIDEO_UPLOAD_TIMEOUT="${XVIDEO_UPLOAD_TIMEOUT:-1800}"
     XVIDEO_LOCAL_UPLOAD_PROGRESS_CAP="${XVIDEO_LOCAL_UPLOAD_PROGRESS_CAP:-12}"
     XVIDEO_TELEGRAM_UPLOAD_EST_MBPS="${XVIDEO_TELEGRAM_UPLOAD_EST_MBPS:-0.35}"
+    XVIDEO_ADMIN_CHAT_IDS="${XVIDEO_ADMIN_CHAT_IDS:-${ADMIN_CHAT_IDS}}"
+    XVIDEO_COOKIES_FILE="${XVIDEO_COOKIES_FILE:-${COOKIES_FILE}}"
+    XVIDEO_COOKIE_MAX_BYTES="${XVIDEO_COOKIE_MAX_BYTES:-${COOKIE_MAX_BYTES}}"
+    XVIDEO_STAGING_BASE_DIR="${XVIDEO_STAGING_BASE_DIR:-${STAGING_BASE_DIR}}"
   fi
   XVIDEO_BOT_TOKEN="${input_bot_token}"
+  if [[ -n "${input_admin_chat_ids}" ]]; then
+    XVIDEO_ADMIN_CHAT_IDS="${input_admin_chat_ids}"
+  fi
+  if [[ -n "${input_cookies_file}" ]]; then
+    XVIDEO_COOKIES_FILE="${input_cookies_file}"
+  fi
+  if [[ -n "${input_cookie_max_bytes}" ]]; then
+    XVIDEO_COOKIE_MAX_BYTES="${input_cookie_max_bytes}"
+  fi
+  if [[ -n "${input_staging_base_dir}" ]]; then
+    XVIDEO_STAGING_BASE_DIR="${input_staging_base_dir}"
+  fi
+  if [[ -n "${input_staging_dir}" ]]; then
+    XVIDEO_STAGING_DIR="${input_staging_dir}"
+  fi
 }
 
 install_or_update_app_code() {
@@ -132,6 +172,9 @@ install_or_update_app_code() {
   fi
   if ! grep -q "XVIDEO_STAGING_DIR" "${APP_SRC_DIR}/xvideo_to_telegram_bot.py"; then
     die "Deployed bot code does not support per-bot staging/log env vars. Upload the latest xvideo_to_telegram_bot.py next to this script and rerun."
+  fi
+  if ! grep -q "XVIDEO_COOKIES_FILE" "${APP_SRC_DIR}/xvideo_to_telegram_bot.py"; then
+    die "Deployed bot code does not support Telegram cookie upload. Upload the latest xvideo_to_telegram_bot.py next to this script and rerun."
   fi
   [[ -x "${APP_DIR}/venv/bin/python" ]] || die "${APP_DIR}/venv missing. Run deploy_ec2.sh first."
   "${APP_DIR}/venv/bin/python" -m py_compile "${APP_SRC_DIR}/xvideo_to_telegram_bot.py"
@@ -209,13 +252,14 @@ confirm_overwrite_if_needed() {
 
 write_instance_env() {
   local env_file="${ENV_DIR}/${BOT_NAME}.env"
-  local staging_dir="/tmp/xvideo-dl-${BOT_NAME}"
+  local staging_dir="${XVIDEO_STAGING_DIR:-${XVIDEO_STAGING_BASE_DIR}/${BOT_NAME}}"
   local log_dir="/var/log/xvideo-to-telegram"
   local log_file="${log_dir}/${BOT_NAME}.log"
 
   install -d -m 755 -o root -g root "${ENV_DIR}"
   install -d -m 755 -o "${APP_USER}" -g "${APP_USER}" "${staging_dir}"
   install -d -m 755 -o "${APP_USER}" -g "${APP_USER}" "${log_dir}"
+  install -d -m 700 -o "${APP_USER}" -g "${APP_USER}" "$(dirname "${XVIDEO_COOKIES_FILE}")"
   touch "${log_file}"
   chown "${APP_USER}:${APP_USER}" "${log_file}"
   chmod 640 "${log_file}"
@@ -225,6 +269,7 @@ write_instance_env() {
     printf 'XVIDEO_BOT_TOKEN=%s\n' "$(escape_env_value "${XVIDEO_BOT_TOKEN}")"
     printf 'BOT_API_BASE_URL=%s\n' "$(escape_env_value "${BOT_API_BASE_URL}")"
     printf 'YT_DLP_BIN=%s\n' "$(escape_env_value "${YT_DLP_BIN}")"
+    printf 'FFMPEG_BIN=%s\n' "$(escape_env_value "${FFMPEG_BIN}")"
     printf 'FFPROBE_BIN=%s\n' "$(escape_env_value "${FFPROBE_BIN}")"
     printf 'CURL_BIN=%s\n' "$(escape_env_value "${CURL_BIN}")"
     printf 'XVIDEO_UPLOAD_TIMEOUT=%s\n' "$(escape_env_value "${XVIDEO_UPLOAD_TIMEOUT}")"
@@ -232,6 +277,9 @@ write_instance_env() {
     printf 'XVIDEO_TELEGRAM_UPLOAD_EST_MBPS=%s\n' "$(escape_env_value "${XVIDEO_TELEGRAM_UPLOAD_EST_MBPS}")"
     printf 'XVIDEO_STAGING_DIR=%s\n' "$(escape_env_value "${staging_dir}")"
     printf 'XVIDEO_LOG_FILE=%s\n' "$(escape_env_value "${log_file}")"
+    printf 'XVIDEO_COOKIES_FILE=%s\n' "$(escape_env_value "${XVIDEO_COOKIES_FILE}")"
+    printf 'XVIDEO_ADMIN_CHAT_IDS=%s\n' "$(escape_env_value "${XVIDEO_ADMIN_CHAT_IDS}")"
+    printf 'XVIDEO_COOKIE_MAX_BYTES=%s\n' "$(escape_env_value "${XVIDEO_COOKIE_MAX_BYTES}")"
   } > "${env_file}"
 }
 
